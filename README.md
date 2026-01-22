@@ -217,7 +217,7 @@ All admin controls are implemented as **dedicated notebook cells**.
 #### Clone Repository
 
 ```bash
-git clone https://github.com/your-repo/rydora.git
+git clone https://github.com/ChandanM123456/Rydora-Ride-Sharing-App-for-Real-World-Urban-Mobility
 ```
 
 #### Firebase Configuration
