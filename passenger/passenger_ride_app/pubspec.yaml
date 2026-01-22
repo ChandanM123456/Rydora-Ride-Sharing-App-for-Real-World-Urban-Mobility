@@ -1,0 +1,31 @@
+name: passenger_ride_app
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  # Using a broad SDK range to allow for recent updates from flutter upgrade
+  sdk: '>=3.8.1 <4.0.0' # Retaining your specific lower bound, but upper bound ensures compatibility.
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Updated to the latest stable versions
+  firebase_core: ^2.27.0
+  cloud_firestore: ^4.15.9
+  geolocator: ^11.0.0
+  flutter_map: ^8.2.1 # Explicitly targeting the latest major version that uses 'builder'
+  latlong2: ^0.9.1
+  http: ^1.2.1
+  flutter_polyline_points: ^2.1.0 # Updated to latest stable
+  firebase_auth: ^4.17.9
+  geocoding: ^2.1.1
+  permission_handler: ^11.0.1
+  url_launcher: ^6.2.2
+  intl: ^0.18.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0

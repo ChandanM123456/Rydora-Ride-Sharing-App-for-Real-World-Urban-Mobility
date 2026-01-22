@@ -1,0 +1,943 @@
+"""
+Enhanced Greedy Ride Matcher - Python
+With Complete Real-time Status Synchronization between Rider and Passenger Databases
+"""
+
+import os
+import time
+import traceback
+from math import radians, sin, cos, sqrt, atan2
+from typing import Dict, List, Optional, Tuple
+import heapq
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+from firebase_admin.firestore import GeoPoint
+
+# ----------------- CONFIG -----------------
+PASSENGER_DB_CREDENTIALS = os.environ.get(
+    "PASSENGER_DB_CREDENTIALS",
+    "passenger-ride-app-firebase-adminsdk-fbsvc-1061e4a556.json",
+)
+RIDER_DB_CREDENTIALS = os.environ.get(
+    "RIDER_DB_CREDENTIALS",
+    "rider-ba88e-firebase-adminsdk-fbsvc-57d40ed3f7.json",
+)
+
+PASSENGER_REQUESTS_COL = "public_ride_requests"
+RIDERS_COL = "riders"
+DRIVER_PROPOSALS_COL = "driver_proposals"
+SOS_ALERTS_COL = "sos_alerts"
+COMPLETED_RIDES_COL = "completed_rides"
+CANCELLED_RIDES_COL = "cancelled_rides"
+
+# Matching parameters
+MAX_MATCH_DISTANCE_KM = float(os.environ.get("MAX_MATCH_DISTANCE_KM", 10.0))
+MAX_DESTINATION_DEVIATION_KM = float(os.environ.get("MAX_DESTINATION_DEVIATION_KM", 8.0))
+MAX_DETOUR_RATIO = float(os.environ.get("MAX_DETOUR_RATIO", 1.5))
+MIN_DRIVER_RATING = float(os.environ.get("MIN_DRIVER_RATING", 3.5))
+
+ELIGIBLE_DRIVER_STATUSES = [
+    "available",
+    "idle", 
+    "on_route_to_pickup",
+    "en_route"
+]
+
+# Complete status mapping between driver_proposals and public_ride_requests
+STATUS_MAPPING = {
+    "pending": "proposed",
+    "accepted": "accepted", 
+    "rejected": "no_drivers_available",
+    "arrived_at_pickup": "arrived_at_pickup",
+    "picked_up": "picked_up",
+    "on_way": "on_way",
+    "completed": "completed",
+    "cancelled": "cancelled",
+    "cancelled_by_rider": "cancelled",
+    "cancelled_by_passenger": "cancelled",
+    "no_drivers_available": "no_drivers_available"
+}
+
+# Priority weights for matching algorithm
+WEIGHTS = {
+    'distance': 0.35,
+    'rating': 0.25,
+    'detour': 0.20,
+    'experience': 0.15,
+    'vehicle_match': 0.05
+}
+
+# ----------------- Enhanced Utilities -----------------
+
+def log(msg: str, level: str = "INFO"):
+    """Enhanced logging with levels."""
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] [{level}] {msg}")
+
+def init_firestore_app(cred_path: str, name: str):
+    """Initialize Firestore client for a Firebase app."""
+    if not os.path.exists(cred_path):
+        log(f"credential file not found: {cred_path}", "ERROR")
+        return None
+    try:
+        cred = credentials.Certificate(cred_path)
+        try:
+            app = firebase_admin.get_app(name)
+            log(f"Re-using Firebase app '{name}'.", "DEBUG")
+        except ValueError:
+            app = firebase_admin.initialize_app(cred, name=name)
+            log(f"Initialized Firebase app '{name}'.", "INFO")
+        return firestore.client(app=app)
+    except Exception as e:
+        log(f"Error initializing Firebase app '{name}': {e}", "ERROR")
+        traceback.print_exc()
+        return None
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine distance between two points in kilometers."""
+    lat1_rad, lon1_rad, lat2_rad, lon2_rad = map(radians, map(float, [lat1, lon1, lat2, lon2]))
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = sin(dlat / 2) ** 2 + cos(lat1_rad) * cos(lat2_rad) * sin(dlon / 2) ** 2
+    return 2 * 6371.0 * atan2(sqrt(a), sqrt(1 - a))
+
+def to_geopoint(loc) -> Optional[GeoPoint]:
+    """Enhanced GeoPoint conversion with better error handling."""
+    if loc is None:
+        return None
+    if isinstance(loc, GeoPoint):
+        return loc
+    if isinstance(loc, dict):
+        lat_keys = ["latitude", "lat", "_latitude"]
+        lng_keys = ["longitude", "lng", "lon", "_longitude"]
+        
+        lat = next((loc.get(k) for k in lat_keys if loc.get(k) is not None), None)
+        lng = next((loc.get(k) for k in lng_keys if loc.get(k) is not None), None)
+        
+        for nested_key in ["coords", "location", "geo", "position", "coordinates"]:
+            if nested_key in loc and isinstance(loc[nested_key], dict):
+                nested = loc[nested_key]
+                lat = next((nested.get(k) for k in lat_keys if nested.get(k) is not None), lat)
+                lng = next((nested.get(k) for k in lng_keys if nested.get(k) is not None), lng)
+        
+        if lat is not None and lng is not None:
+            try:
+                return GeoPoint(float(lat), float(lng))
+            except (ValueError, TypeError):
+                return None
+    
+    if hasattr(loc, "latitude") and hasattr(loc, "longitude"):
+        try:
+            return GeoPoint(float(loc.latitude), float(loc.longitude))
+        except (ValueError, TypeError):
+            return None
+    
+    return None
+
+def calculate_detour_metrics(driver_start: GeoPoint, driver_end: GeoPoint, 
+                           pickup: GeoPoint, dropoff: GeoPoint) -> Tuple[float, float, float]:
+    """Calculate detour metrics for a potential match."""
+    base_distance = haversine_km(
+        driver_start.latitude, driver_start.longitude,
+        driver_end.latitude, driver_end.longitude
+    )
+    
+    if base_distance == 0:
+        base_distance = 0.1
+    
+    new_total_distance = (
+        haversine_km(driver_start.latitude, driver_start.longitude, pickup.latitude, pickup.longitude) +
+        haversine_km(pickup.latitude, pickup.longitude, dropoff.latitude, dropoff.longitude) +
+        haversine_km(dropoff.latitude, dropoff.longitude, driver_end.latitude, driver_end.longitude)
+    )
+    
+    incremental_detour = new_total_distance - base_distance
+    detour_ratio = new_total_distance / base_distance
+    
+    return incremental_detour, detour_ratio, base_distance
+
+def calculate_match_score(distance: float, driver_rating: float, detour_ratio: float,
+                        experience: int, vehicle_match: bool, passenger_rating: float) -> float:
+    """Calculate comprehensive match score (0-1) using multiple criteria."""
+    distance_score = max(0, 1 - (distance / MAX_MATCH_DISTANCE_KM))
+    rating_score = (driver_rating / 5.0) * 0.7 + (passenger_rating / 5.0) * 0.3
+    detour_score = max(0, 1 - (detour_ratio - 1))
+    experience_score = min(experience / 100.0, 1.0)
+    vehicle_score = 1.0 if vehicle_match else 0.5
+    
+    total_score = (
+        WEIGHTS['distance'] * distance_score +
+        WEIGHTS['rating'] * rating_score +
+        WEIGHTS['detour'] * detour_score +
+        WEIGHTS['experience'] * experience_score +
+        WEIGHTS['vehicle_match'] * vehicle_score
+    )
+    
+    return total_score
+
+# ----------------- Enhanced Matching Logic -----------------
+
+class RideMatcher:
+    """Enhanced ride matching with greedy optimization and real-time updates."""
+    
+    def __init__(self, passenger_db, rider_db):
+        self.passenger_db = passenger_db
+        self.rider_db = rider_db
+        self.active_matches = {}
+        
+    def create_enhanced_proposal_payload(self, passenger_doc, passenger_data, 
+                                       driver_doc_id, driver_data, match_score: float) -> Dict:
+        """Create comprehensive proposal payload with all ride details."""
+        passenger_uid = passenger_data.get("passengerId")
+        pickup_loc = to_geopoint(passenger_data.get("pickupLocation"))
+        dest_loc = to_geopoint(passenger_data.get("destinationLocation"))
+        driver_loc = to_geopoint(driver_data.get("currentLocation"))
+        
+        pickup_distance = haversine_km(
+            driver_loc.latitude, driver_loc.longitude,
+            pickup_loc.latitude, pickup_loc.longitude
+        ) if driver_loc and pickup_loc else 0
+        
+        total_distance = haversine_km(
+            pickup_loc.latitude, pickup_loc.longitude,
+            dest_loc.latitude, dest_loc.longitude
+        ) if pickup_loc and dest_loc else 0
+        
+        fare_amount = self.calculate_fare(total_distance, passenger_data.get("rideType", "Standard"))
+        
+        payload = {
+            # Proposal metadata
+            "request_id": passenger_doc.id,
+            "status": "pending",
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "match_score": match_score,
+            "priority_level": self.calculate_priority_level(match_score),
+            
+            # Passenger information
+            "passengerId": passenger_uid,
+            "passengerName": passenger_data.get("passengerName", "Unknown Passenger"),
+            "passengerPhone": passenger_data.get("passengerPhone", "Not Provided"),
+            "passengerRating": passenger_data.get("passengerRating", 5.0),
+            
+            # Ride details
+            "pickupLocation": pickup_loc,
+            "destinationLocation": dest_loc,
+            "pickupAddress": passenger_data.get("pickupAddress", ""),
+            "destinationAddress": passenger_data.get("destinationAddress", ""),
+            "fareAmount": fare_amount,
+            "paymentMethod": passenger_data.get("paymentMethod", "Cash"),
+            "rideType": passenger_data.get("rideType", "Standard"),
+            "estimatedDistance": f"{total_distance:.1f} km",
+            "estimatedDuration": f"{(total_distance * 2):.0f} min",
+            "specialRequests": passenger_data.get("specialRequests", "None"),
+            "vehiclePreference": passenger_data.get("vehiclePreference", "Any"),
+            "luggageCount": passenger_data.get("luggageCount", 0),
+            "passengerCount": passenger_data.get("passengerCount", 1),
+            
+            # Driver information
+            "riderUid": driver_doc_id,
+            "riderName": driver_data.get("name", "Unknown Driver"),
+            "riderPhone": driver_data.get("phone", "Not Provided"),
+            "riderRating": driver_data.get("rating", 5.0),
+            "riderLocation": driver_loc,
+            "vehicleNumber": driver_data.get("vehicle_number"),
+            "vehicleModel": driver_data.get("vehicle_model"),
+            "vehicleColor": driver_data.get("vehicle_color"),
+            "vehicleType": driver_data.get("vehicle_type"),
+            "totalRides": driver_data.get("total_rides", 0),
+            
+            # Matching metrics
+            "distanceToPickup": pickup_distance,
+            "estimatedPickupTime": f"{(pickup_distance * 3):.0f} min",
+            
+            # OTP and security
+            "otp": passenger_data.get("otp", "0000"),
+            "otpVerified": False,
+            
+            # Timestamps
+            "requestTimestamp": passenger_data.get("requestTimestamp"),
+            "lastUpdated": firestore.SERVER_TIMESTAMP,
+        }
+        
+        return {k: v for k, v in payload.items() if v is not None}
+    
+    def calculate_fare(self, distance_km: float, ride_type: str) -> float:
+        """Calculate fare based on distance and ride type."""
+        base_fare = 30.0
+        rate_per_km = 8.0
+        
+        if ride_type == 'Premium':
+            base_fare = 50.0
+            rate_per_km = 12.0
+        elif ride_type == 'SUV':
+            base_fare = 70.0
+            rate_per_km = 15.0
+        elif ride_type == 'Electric':
+            base_fare = 35.0
+            rate_per_km = 7.0
+        
+        return base_fare + (distance_km * rate_per_km)
+    
+    def calculate_priority_level(self, match_score: float) -> int:
+        """Calculate priority level based on match score."""
+        if match_score >= 0.8:
+            return 1
+        elif match_score >= 0.6:
+            return 2
+        else:
+            return 3
+    
+    def find_best_driver_match(self, passenger_data: Dict, pickup: GeoPoint, dest: GeoPoint) -> Optional[Tuple]:
+        """Find the best driver match using greedy optimization."""
+        try:
+            vehicle_pref = passenger_data.get("vehiclePreference", "Any")
+            passenger_rating = passenger_data.get("passengerRating", 5.0)
+            
+            riders_ref = self.rider_db.collection(RIDERS_COL)
+            riders_q = riders_ref.where("status", "in", ELIGIBLE_DRIVER_STATUSES)
+            riders_q = riders_q.where("is_online", "==", True)
+            
+            riders = list(riders_q.stream())
+            log(f"Found {len(riders)} eligible drivers for matching", "DEBUG")
+            
+            best_match = None
+            best_score = -1
+            
+            for driver_doc in riders:
+                try:
+                    driver_data = driver_doc.to_dict() or {}
+                    driver_id = driver_doc.id
+                    
+                    if not self.is_driver_eligible(driver_data, vehicle_pref):
+                        continue
+                    
+                    driver_loc = to_geopoint(driver_data.get("currentLocation"))
+                    if not driver_loc:
+                        continue
+                    
+                    pickup_distance = haversine_km(
+                        driver_loc.latitude, driver_loc.longitude,
+                        pickup.latitude, pickup.longitude
+                    )
+                    
+                    if pickup_distance > MAX_MATCH_DISTANCE_KM:
+                        continue
+                    
+                    driver_dest = to_geopoint(driver_data.get("destination")) or dest
+                    incremental_detour, detour_ratio, base_distance = calculate_detour_metrics(
+                        driver_loc, driver_dest, pickup, dest
+                    )
+                    
+                    if detour_ratio > MAX_DETOUR_RATIO:
+                        continue
+                    
+                    driver_rating = driver_data.get("rating", 5.0)
+                    experience = driver_data.get("total_rides", 0)
+                    vehicle_match = self.check_vehicle_match(vehicle_pref, driver_data.get("vehicle_type"))
+                    
+                    match_score = calculate_match_score(
+                        pickup_distance, driver_rating, detour_ratio,
+                        experience, vehicle_match, passenger_rating
+                    )
+                    
+                    if match_score > best_score:
+                        best_score = match_score
+                        best_match = (driver_id, driver_data, driver_loc, match_score, pickup_distance, incremental_detour)
+                        
+                except Exception as e:
+                    log(f"Error evaluating driver {driver_doc.id}: {e}", "WARNING")
+                    continue
+            
+            return best_match
+            
+        except Exception as e:
+            log(f"Error in find_best_driver_match: {e}", "ERROR")
+            return None
+    
+    def is_driver_eligible(self, driver_data: Dict, vehicle_pref: str) -> bool:
+        """Check if driver meets all eligibility criteria."""
+        if driver_data.get("rating", 5.0) < MIN_DRIVER_RATING:
+            return False
+        
+        if not self.check_vehicle_match(vehicle_pref, driver_data.get("vehicle_type")):
+            return False
+        
+        last_update = driver_data.get("lastUpdated")
+        if last_update:
+            if hasattr(last_update, 'timestamp'):
+                time_diff = time.time() - last_update.timestamp()
+                if time_diff > 600:
+                    return False
+        
+        return True
+    
+    def check_vehicle_match(self, passenger_pref: str, driver_vehicle: str) -> bool:
+        """Check if driver's vehicle matches passenger preference."""
+        if passenger_pref == "Any":
+            return True
+        if not driver_vehicle:
+            return False
+        
+        passenger_pref = passenger_pref.lower()
+        driver_vehicle = driver_vehicle.lower()
+        
+        return passenger_pref in driver_vehicle or driver_vehicle in passenger_pref
+    
+    def create_match_proposal(self, passenger_doc, best_match: Tuple) -> bool:
+        """Create match proposal and update databases."""
+        try:
+            driver_id, driver_data, driver_loc, match_score, pickup_distance, detour = best_match
+            passenger_data = passenger_doc.to_dict() or {}
+            
+            proposal_payload = self.create_enhanced_proposal_payload(
+                passenger_doc, passenger_data, driver_id, driver_data, match_score
+            )
+            
+            proposal_ref = self.rider_db.collection(DRIVER_PROPOSALS_COL).document()
+            proposal_ref.set(proposal_payload)
+            
+            # Update passenger request with match info
+            self.passenger_db.collection(PASSENGER_REQUESTS_COL).document(passenger_doc.id).update({
+                "status": "proposed",
+                "riderUid": driver_id,
+                "riderName": driver_data.get("name", "Unknown Driver"),
+                "riderPhone": driver_data.get("phone", "Not Provided"),
+                "riderLocation": driver_loc,
+                "matchedDriverName": driver_data.get("name", "Unknown Driver"),
+                "matchedDriverPhone": driver_data.get("phone", "Not Provided"),
+                "matchedDriverVehicle": driver_data.get("vehicle_type", "Unknown Vehicle"),
+                "proposed_at": firestore.SERVER_TIMESTAMP,
+                "match_score": match_score,
+                "fareAmount": proposal_payload.get("fareAmount", 0.0),
+                "proposal_id": proposal_ref.id,  # Store proposal ID for reference
+            })
+            
+            # Update driver status
+            self.rider_db.collection(RIDERS_COL).document(driver_id).update({
+                "status": "reserved_for_proposal",
+                "reserved_for_request": passenger_doc.id,
+                "current_proposal_id": proposal_ref.id,
+                "lastUpdated": firestore.SERVER_TIMESTAMP,
+            })
+            
+            log(f"Created proposal for passenger {passenger_doc.id} -> driver {driver_id} "
+                f"(score: {match_score:.3f}, distance: {pickup_distance:.2f}km)", "INFO")
+            
+            return True
+            
+        except Exception as e:
+            log(f"Failed to create match proposal: {e}", "ERROR")
+            return False
+    
+    def match_ride_request(self, passenger_doc):
+        """Main matching function for a single ride request."""
+        try:
+            passenger_data = passenger_doc.to_dict() or {}
+            
+            if not passenger_data or passenger_data.get("status") != "pending":
+                return
+            
+            pickup = to_geopoint(passenger_data.get("pickupLocation"))
+            dest = to_geopoint(passenger_data.get("destinationLocation"))
+            
+            if not pickup or not dest:
+                log(f"Invalid locations for passenger {passenger_doc.id}", "WARNING")
+                return
+            
+            log(f"Matching passenger {passenger_doc.id} from {passenger_data.get('pickupAddress', 'Unknown')}")
+            
+            best_match = self.find_best_driver_match(passenger_data, pickup, dest)
+            
+            if best_match:
+                self.create_match_proposal(passenger_doc, best_match)
+            else:
+                log(f"No suitable driver found for passenger {passenger_doc.id}", "INFO")
+                self.passenger_db.collection(PASSENGER_REQUESTS_COL).document(passenger_doc.id).update({
+                    "status": "no_drivers_available",
+                    "lastUpdated": firestore.SERVER_TIMESTAMP,
+                })
+                
+        except Exception as e:
+            log(f"Error matching passenger {passenger_doc.id}: {e}", "ERROR")
+            traceback.print_exc()
+
+# ----------------- Complete Real-time Status Synchronization -----------------
+
+class StatusSynchronizer:
+    """Handles complete real-time status synchronization between rider and passenger databases."""
+    
+    def __init__(self, passenger_db, rider_db):
+        self.passenger_db = passenger_db
+        self.rider_db = rider_db
+    
+    def sync_status_to_passenger(self, proposal_id: str, new_status: str, proposal_data: Dict):
+        """Sync status from driver_proposals to public_ride_requests with complete lifecycle management."""
+        try:
+            request_id = proposal_data.get("request_id")
+            if not request_id:
+                log(f"No request_id found in proposal {proposal_id}", "ERROR")
+                return
+            
+            # Map driver_proposal status to passenger request status
+            passenger_status = STATUS_MAPPING.get(new_status, new_status)
+            
+            update_data = {
+                "status": passenger_status,
+                "lastUpdated": firestore.SERVER_TIMESTAMP,
+            }
+            
+            # Add timestamp based on status
+            timestamp_fields = {
+                "accepted": "accepted_at",
+                "arrived_at_pickup": "arrived_at_pickup_at",
+                "picked_up": "picked_up_at",
+                "completed": "completed_at",
+                "cancelled": "cancelled_at",
+                "cancelled_by_rider": "cancelled_at",
+                "cancelled_by_passenger": "cancelled_at"
+            }
+            
+            if new_status in timestamp_fields:
+                update_data[timestamp_fields[new_status]] = firestore.SERVER_TIMESTAMP
+            
+            # Update passenger request
+            self.passenger_db.collection(PASSENGER_REQUESTS_COL).document(request_id).update(update_data)
+            
+            log(f"Synced status: {new_status} -> {passenger_status} for request {request_id}", "INFO")
+            
+            # Handle ride completion or cancellation
+            if new_status in ["completed", "cancelled", "cancelled_by_rider", "cancelled_by_passenger"]:
+                self._handle_ride_termination(proposal_id, new_status, proposal_data, request_id)
+            
+            # Also update rider status if needed
+            self.update_rider_status_based_on_proposal(proposal_id, new_status, proposal_data)
+            
+        except Exception as e:
+            log(f"Error syncing status to passenger for proposal {proposal_id}: {e}", "ERROR")
+    
+    def _handle_ride_termination(self, proposal_id: str, status: str, proposal_data: Dict, request_id: str):
+        """Handle ride completion or cancellation by moving to appropriate collections."""
+        try:
+            if status == "completed":
+                # Move to completed_rides collection
+                self._move_to_completed_rides(proposal_id, proposal_data, request_id)
+            else:
+                # Move to cancelled_rides collection
+                self._move_to_cancelled_rides(proposal_id, proposal_data, request_id, status)
+                
+        except Exception as e:
+            log(f"Error handling ride termination for proposal {proposal_id}: {e}", "ERROR")
+    
+    def _move_to_completed_rides(self, proposal_id: str, proposal_data: Dict, request_id: str):
+        """Move completed ride to completed_rides collection."""
+        try:
+            # Get additional data from passenger request
+            passenger_request = self.passenger_db.collection(PASSENGER_REQUESTS_COL).document(request_id).get()
+            passenger_data = passenger_request.to_dict() or {}
+            
+            # Create completed ride document
+            completed_ride_data = {
+                **proposal_data,
+                **passenger_data,
+                "proposal_id": proposal_id,
+                "request_id": request_id,
+                "completion_timestamp": firestore.SERVER_TIMESTAMP,
+                "ride_end_time": firestore.SERVER_TIMESTAMP,
+            }
+            
+            # Remove fields that shouldn't be in completed rides
+            completed_ride_data.pop('status', None)
+            completed_ride_data.pop('lastUpdated', None)
+            
+            # Add to completed_rides collection
+            self.passenger_db.collection(COMPLETED_RIDES_COL).add(completed_ride_data)
+            
+            log(f"Moved completed ride {proposal_id} to completed_rides collection", "INFO")
+            
+        except Exception as e:
+            log(f"Error moving to completed_rides for proposal {proposal_id}: {e}", "ERROR")
+    
+    def _move_to_cancelled_rides(self, proposal_id: str, proposal_data: Dict, request_id: str, cancellation_reason: str):
+        """Move cancelled ride to cancelled_rides collection."""
+        try:
+            # Get additional data from passenger request
+            passenger_request = self.passenger_db.collection(PASSENGER_REQUESTS_COL).document(request_id).get()
+            passenger_data = passenger_request.to_dict() or {}
+            
+            # Create cancelled ride document
+            cancelled_ride_data = {
+                **proposal_data,
+                **passenger_data,
+                "proposal_id": proposal_id,
+                "request_id": request_id,
+                "cancellation_reason": cancellation_reason,
+                "cancellation_timestamp": firestore.SERVER_TIMESTAMP,
+                "cancelled_by": "system" if cancellation_reason == "cancelled" else cancellation_reason.split('_')[-1],
+            }
+            
+            # Remove fields that shouldn't be in cancelled rides
+            cancelled_ride_data.pop('status', None)
+            cancelled_ride_data.pop('lastUpdated', None)
+            
+            # Add to cancelled_rides collection
+            self.passenger_db.collection(CANCELLED_RIDES_COL).add(cancelled_ride_data)
+            
+            log(f"Moved cancelled ride {proposal_id} to cancelled_rides collection", "INFO")
+            
+        except Exception as e:
+            log(f"Error moving to cancelled_rides for proposal {proposal_id}: {e}", "ERROR")
+    
+    def update_rider_status_based_on_proposal(self, proposal_id: str, new_status: str, proposal_data: Dict):
+        """Update rider status based on proposal status changes with complete lifecycle."""
+        try:
+            rider_uid = proposal_data.get("riderUid")
+            if not rider_uid:
+                return
+            
+            rider_status_map = {
+                "accepted": "on_route_to_pickup",
+                "arrived_at_pickup": "arrived_at_pickup",
+                "picked_up": "on_trip",
+                "completed": "available",
+                "cancelled": "available",
+                "cancelled_by_rider": "available",
+                "cancelled_by_passenger": "available",
+                "rejected": "available"
+            }
+            
+            new_rider_status = rider_status_map.get(new_status)
+            if new_rider_status:
+                update_data = {
+                    "status": new_rider_status,
+                    "lastUpdated": firestore.SERVER_TIMESTAMP,
+                }
+                
+                # If ride is terminated (completed or cancelled), clear all ride-related fields
+                if new_status in ["completed", "cancelled", "cancelled_by_rider", "cancelled_by_passenger", "rejected"]:
+                    update_data.update({
+                        "current_ride_request": firestore.DELETE_FIELD,
+                        "current_proposal_id": firestore.DELETE_FIELD,
+                        "reserved_for_request": firestore.DELETE_FIELD,
+                        "currentRouteStart": firestore.DELETE_FIELD,
+                        "currentRouteEnd": firestore.DELETE_FIELD,
+                    })
+                    
+                    # If going back to available, ensure is_online is true
+                    if new_rider_status == "available":
+                        update_data["is_online"] = True
+                
+                self.rider_db.collection(RIDERS_COL).document(rider_uid).update(update_data)
+                log(f"Updated rider {rider_uid} status to {new_rider_status}", "DEBUG")
+                
+        except Exception as e:
+            log(f"Error updating rider status for proposal {proposal_id}: {e}", "ERROR")
+    
+    def sync_rider_location_to_passenger(self, rider_id: str, rider_data: Dict):
+        """Sync rider location updates to passenger request."""
+        try:
+            current_ride_request = rider_data.get("current_ride_request")
+            current_location = rider_data.get("currentLocation")
+            
+            if current_ride_request and current_location:
+                self.passenger_db.collection(PASSENGER_REQUESTS_COL).document(current_ride_request).update({
+                    "riderLocation": current_location,
+                    "lastLocationUpdate": firestore.SERVER_TIMESTAMP,
+                })
+                log(f"Synced rider location for request {current_ride_request}", "DEBUG")
+                
+        except Exception as e:
+            log(f"Error syncing rider location for rider {rider_id}: {e}", "ERROR")
+    
+    def handle_manual_status_change(self, proposal_id: str, new_status: str, proposal_data: Dict):
+        """Handle manual status changes in driver_proposals with complete synchronization."""
+        try:
+            log(f"Handling manual status change: {proposal_id} -> {new_status}", "INFO")
+            
+            # Sync to passenger request
+            self.sync_status_to_passenger(proposal_id, new_status, proposal_data)
+            
+            # If status is completed or cancelled, ensure proper cleanup
+            if new_status in ["completed", "cancelled"]:
+                self._ensure_ride_cleanup(proposal_id, proposal_data)
+                
+        except Exception as e:
+            log(f"Error handling manual status change for proposal {proposal_id}: {e}", "ERROR")
+    
+    def _ensure_ride_cleanup(self, proposal_id: str, proposal_data: Dict):
+        """Ensure proper cleanup when ride is completed or cancelled."""
+        try:
+            rider_uid = proposal_data.get("riderUid")
+            if rider_uid:
+                # Double-check rider status is set to available
+                self.rider_db.collection(RIDERS_COL).document(rider_uid).update({
+                    "status": "available",
+                    "is_online": True,
+                    "current_ride_request": firestore.DELETE_FIELD,
+                    "current_proposal_id": firestore.DELETE_FIELD,
+                    "reserved_for_request": firestore.DELETE_FIELD,
+                    "lastUpdated": firestore.SERVER_TIMESTAMP,
+                })
+                log(f"Ensured cleanup for rider {rider_uid} after ride termination", "DEBUG")
+                
+        except Exception as e:
+            log(f"Error ensuring ride cleanup for proposal {proposal_id}: {e}", "ERROR")
+
+# ----------------- Enhanced Real-time Listeners -----------------
+
+class RealTimeListener:
+    """Handles real-time updates and event processing with complete status synchronization."""
+    
+    def __init__(self, passenger_db, rider_db, matcher: RideMatcher):
+        self.passenger_db = passenger_db
+        self.rider_db = rider_db
+        self.matcher = matcher
+        self.status_sync = StatusSynchronizer(passenger_db, rider_db)
+    
+    def listen_for_pending_requests(self):
+        """Listen for new pending ride requests."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                if change.type.name in ("ADDED", "MODIFIED"):
+                    doc = change.document
+                    data = doc.to_dict() or {}
+                    if data.get("status") == "pending":
+                        log(f"New pending request: {doc.id}", "INFO")
+                        self.matcher.match_ride_request(doc)
+        
+        try:
+            query = self.passenger_db.collection(PASSENGER_REQUESTS_COL).where("status", "==", "pending")
+            query.on_snapshot(on_snapshot)
+            log("Pending requests listener started", "INFO")
+        except Exception as e:
+            log(f"Failed to start pending requests listener: {e}", "ERROR")
+    
+    def listen_for_driver_proposal_updates(self):
+        """Listen for ALL status changes in driver_proposals and sync to passengers."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                if change.type.name == "MODIFIED":
+                    doc = change.document
+                    data = doc.to_dict() or {}
+                    proposal_id = doc.id
+                    
+                    # Get previous status from change document
+                    previous_data = getattr(change.document, '_previous', {})
+                    old_status = previous_data.get('status')
+                    new_status = data.get('status')
+                    
+                    # If status changed, sync to passenger
+                    if old_status != new_status and new_status:
+                        log(f"Driver proposal status changed: {proposal_id} - {old_status} -> {new_status}", "INFO")
+                        
+                        # Handle manual status changes with complete synchronization
+                        self.status_sync.handle_manual_status_change(proposal_id, new_status, data)
+        
+        try:
+            query = self.rider_db.collection(DRIVER_PROPOSALS_COL)
+            query.on_snapshot(on_snapshot)
+            log("Driver proposals status sync listener started", "INFO")
+        except Exception as e:
+            log(f"Failed to start driver proposals sync listener: {e}", "ERROR")
+    
+    def listen_for_rider_updates(self):
+        """Listen for rider location and status updates."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                if change.type.name == "MODIFIED":
+                    doc = change.document
+                    data = doc.to_dict() or {}
+                    rider_id = doc.id
+                    
+                    # Sync location updates
+                    if data.get("currentLocation"):
+                        self.status_sync.sync_rider_location_to_passenger(rider_id, data)
+                    
+                    # Handle rider status changes that might need passenger updates
+                    previous_data = getattr(change.document, '_previous', {})
+                    old_status = previous_data.get('status')
+                    new_status = data.get('status')
+                    
+                    if old_status != new_status:
+                        log(f"Rider status changed: {rider_id} - {old_status} -> {new_status}", "DEBUG")
+                        
+                        # If rider goes offline during active ride, handle appropriately
+                        if new_status == "offline" and data.get("current_ride_request"):
+                            self._handle_rider_offline_during_ride(rider_id, data)
+        
+        try:
+            query = self.rider_db.collection(RIDERS_COL)
+            query.on_snapshot(on_snapshot)
+            log("Rider updates listener started", "INFO")
+        except Exception as e:
+            log(f"Failed to start rider updates listener: {e}", "ERROR")
+    
+    def _handle_rider_offline_during_ride(self, rider_id: str, rider_data: Dict):
+        """Handle rider going offline during an active ride."""
+        try:
+            current_proposal_id = rider_data.get("current_proposal_id")
+            if current_proposal_id:
+                # Update proposal status to reflect rider offline
+                self.rider_db.collection(DRIVER_PROPOSALS_COL).document(current_proposal_id).update({
+                    "status": "cancelled_by_rider",
+                    "cancellation_reason": "rider_went_offline",
+                    "lastUpdated": firestore.SERVER_TIMESTAMP,
+                })
+                log(f"Handled rider offline during active ride: {rider_id}", "WARNING")
+                
+        except Exception as e:
+            log(f"Error handling rider offline during ride: {e}", "ERROR")
+    
+    def listen_for_passenger_updates(self):
+        """Listen for passenger request updates that might need rider updates."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                if change.type.name == "MODIFIED":
+                    doc = change.document
+                    data = doc.to_dict() or {}
+                    request_id = doc.id
+                    
+                    # Handle OTP verification
+                    previous_data = getattr(change.document, '_previous', {})
+                    old_otp_verified = previous_data.get('otpVerified', False)
+                    new_otp_verified = data.get('otpVerified', False)
+                    
+                    if not old_otp_verified and new_otp_verified:
+                        log(f"OTP verified for request {request_id}", "INFO")
+                        # Update corresponding driver proposal if exists
+                        proposal_id = data.get('proposal_id')
+                        if proposal_id:
+                            self.rider_db.collection(DRIVER_PROPOSALS_COL).document(proposal_id).update({
+                                "otpVerified": True,
+                                "lastUpdated": firestore.SERVER_TIMESTAMP,
+                            })
+                    
+                    # Handle passenger cancellation
+                    old_status = previous_data.get('status')
+                    new_status = data.get('status')
+                    
+                    if new_status == "cancelled" and old_status != "cancelled":
+                        log(f"Passenger cancelled ride: {request_id}", "INFO")
+                        # Update corresponding driver proposal
+                        proposal_id = data.get('proposal_id')
+                        if proposal_id:
+                            self.rider_db.collection(DRIVER_PROPOSALS_COL).document(proposal_id).update({
+                                "status": "cancelled_by_passenger",
+                                "lastUpdated": firestore.SERVER_TIMESTAMP,
+                            })
+        
+        try:
+            query = self.passenger_db.collection(PASSENGER_REQUESTS_COL)
+            query.on_snapshot(on_snapshot)
+            log("Passenger updates listener started", "INFO")
+        except Exception as e:
+            log(f"Failed to start passenger updates listener: {e}", "ERROR")
+    
+    def listen_for_sos_alerts(self):
+        """Listen for SOS alerts and handle emergency situations."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                if change.type.name == "ADDED":
+                    doc = change.document
+                    data = doc.to_dict() or {}
+                    
+                    if not data.get("resolved", False):
+                        self.handle_sos_alert(doc, data)
+        
+        try:
+            query = self.passenger_db.collection(SOS_ALERTS_COL).where("resolved", "==", False)
+            query.on_snapshot(on_snapshot)
+            log("SOS alerts listener started", "INFO")
+        except Exception as e:
+            log(f"Failed to start SOS alerts listener: {e}", "ERROR")
+    
+    def handle_sos_alert(self, alert_doc, alert_data):
+        """Handle SOS alert - notify support and emergency contacts."""
+        try:
+            ride_id = alert_data.get("rideId")
+            passenger_name = alert_data.get("passengerName")
+            rider_name = alert_data.get("riderName")
+            reason = alert_data.get("reason")
+            
+            log(f"🚨 SOS ALERT: {passenger_name} in ride {ride_id} - Reason: {reason}", "EMERGENCY")
+            
+            alert_doc.reference.update({
+                "being_handled": True,
+                "handler_assigned_at": firestore.SERVER_TIMESTAMP,
+            })
+            
+        except Exception as e:
+            log(f"Error handling SOS alert: {e}", "ERROR")
+    
+    def listen_for_ride_terminations(self):
+        """Listen for ride terminations and ensure proper cleanup."""
+        def on_snapshot(col_snapshot, changes, read_time):
+            for change in changes:
+                if change.type.name == "MODIFIED":
+                    doc = change.document
+                    data = doc.to_dict() or {}
+                    proposal_id = doc.id
+                    
+                    previous_data = getattr(change.document, '_previous', {})
+                    old_status = previous_data.get('status')
+                    new_status = data.get('status')
+                    
+                    # Handle ride terminations
+                    if new_status in ["completed", "cancelled", "cancelled_by_rider", "cancelled_by_passenger"]:
+                        if old_status not in ["completed", "cancelled", "cancelled_by_rider", "cancelled_by_passenger"]:
+                            log(f"Ride termination detected: {proposal_id} - {new_status}", "INFO")
+                            self.status_sync._ensure_ride_cleanup(proposal_id, data)
+        
+        try:
+            query = self.rider_db.collection(DRIVER_PROPOSALS_COL).where("status", "in", [
+                "completed", "cancelled", "cancelled_by_rider", "cancelled_by_passenger"
+            ])
+            query.on_snapshot(on_snapshot)
+            log("Ride terminations listener started", "INFO")
+        except Exception as e:
+            log(f"Failed to start ride terminations listener: {e}", "ERROR")
+
+# ----------------- Main Execution -----------------
+
+def main():
+    """Main execution function."""
+    log("Starting Enhanced Greedy Ride Matcher with Complete Real-time Status Sync", "INFO")
+    
+    # Initialize Firebase connections
+    db_passenger = init_firestore_app(PASSENGER_DB_CREDENTIALS, "passenger_app")
+    db_rider = init_firestore_app(RIDER_DB_CREDENTIALS, "rider_app")
+    
+    if not db_passenger or not db_rider:
+        log("FATAL: Failed to initialize Firebase connections", "ERROR")
+        return
+    
+    # Initialize matcher and listener
+    matcher = RideMatcher(db_passenger, db_rider)
+    listener = RealTimeListener(db_passenger, db_rider, matcher)
+    
+    try:
+        # Start all listeners
+        listener.listen_for_pending_requests()
+        listener.listen_for_driver_proposal_updates()  # Main status sync listener
+        listener.listen_for_rider_updates()
+        listener.listen_for_passenger_updates()
+        listener.listen_for_sos_alerts()
+        listener.listen_for_ride_terminations()  # New: Cleanup listener
+        
+        log("All listeners started successfully", "INFO")
+        log("Ride matching system with complete real-time status sync is now active", "INFO")
+        log("Status synchronization: driver_proposals <-> public_ride_requests", "INFO")
+        log("Automatic cleanup on ride completion/cancellation", "INFO")
+        
+        # Keep the main thread alive
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        log("Shutting down ride matching system", "INFO")
+    except Exception as e:
+        log(f"Fatal error in main loop: {e}", "ERROR")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()

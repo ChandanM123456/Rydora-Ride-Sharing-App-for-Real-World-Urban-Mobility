@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "320096301631",
+    "project_id": "passenger-ride-app",
+    "storage_bucket": "passenger-ride-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:320096301631:android:9932c81d357984c46afe8a",
+        "android_client_info": {
+          "package_name": "com.example.passenger_ride_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBxcj9i637yS8uUEGjvwQzxLZ5AoH8zPCo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
