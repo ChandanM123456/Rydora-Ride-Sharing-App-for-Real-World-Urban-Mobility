@@ -217,7 +217,7 @@ All admin controls are implemented as **dedicated notebook cells**.
 #### Clone Repository
 
 ```bash
-git clone https://github.com/ChandanM123456/Rydora-Ride-Sharing-App-for-Real-World-Urban-Mobility/
+git clone https://github.com/your-repo/rydora.git
 ```
 
 #### Firebase Configuration
@@ -318,3 +318,157 @@ cd rydora_passenger && flutter run
 
 * Ensure driver exists in `active_riders`
 * `is_online == true`
+
+### 🗺️ Map Not Loading
+
+* Check internet
+* Verify OSM `urlTemplate`
+
+### 🔐 Permission Denied
+
+* Confirm Service Account has **Editor / Owner** role
+
+---
+
+## 🌍 Real‑World Problem Statement
+
+Urban mobility today faces several critical challenges:
+
+* ❌ Inefficient rider–passenger matching causing long wait times
+* ❌ High dependency on expensive proprietary map APIs
+* ❌ Centralized logic inside mobile apps, making systems vulnerable to manipulation
+* ❌ Lack of flexibility for admins to monitor, intervene, or analyze ride data in real time
+* ❌ Poor scalability for academic or early‑stage startup implementations
+
+**Rydora is designed to solve these exact real‑world issues** using a clean, modular, and cost‑efficient architecture.
+
+---
+
+## 🚦 What Problem Does Rydora Solve?
+
+Rydora addresses **real urban ride‑sharing problems** by separating responsibilities across three layers:
+
+### 1️⃣ Fair & Transparent Ride Matching
+
+Instead of embedding ride‑matching logic inside the mobile app (which users can reverse‑engineer or manipulate), Rydora:
+
+* Executes matching in a **secure Python Admin engine**
+* Uses **geographical distance (Haversine)** for fair driver assignment
+* Ensures passengers always get the **nearest available rider**
+
+This mirrors how **real ride‑hailing companies** isolate core algorithms from clients.
+
+---
+
+### 2️⃣ Cost‑Effective Mapping Strategy
+
+Commercial ride apps spend heavily on map APIs. Rydora minimizes cost by:
+
+* Using **GraphHopper only for passengers**, where accurate routing and pricing matter
+* Using **OpenStreetMap (OSM)** for riders, where frequent updates would otherwise be expensive
+
+➡️ This hybrid strategy makes Rydora **startup‑friendly and scalable**.
+
+---
+
+### 3️⃣ Real‑Time Urban Mobility Tracking
+
+Rydora continuously tracks:
+
+* Rider availability
+* Rider movement (heartbeat every 5–10 seconds)
+* Ride lifecycle stages
+
+This enables:
+
+* Faster pickups
+* Better city‑level mobility insights
+* Real‑time decision making
+
+---
+
+## 🧠 Why the Python Admin Engine Matters (Real‑World Design)
+
+Most student projects ignore admin control. Rydora treats it as a **first‑class system component**.
+
+### Admin Engine Capabilities:
+
+* 🔄 Live ride matching without redeploying apps
+* 👥 Driver verification & banning
+* 📊 Demand & peak‑hour analytics
+* 🛑 Emergency ride reset in crash scenarios
+
+Using **Jupyter Notebook** allows admins to:
+
+* Write new logic instantly
+* Run diagnostics on live data
+* Perform safe system overrides
+
+This closely resembles **operations dashboards used by real ride‑sharing companies**.
+
+---
+
+## 🔐 Security‑First Architecture
+
+Rydora enforces strong backend control:
+
+* 🔒 Firestore rules prevent riders or passengers from self‑assigning rides
+* 🔑 Only the Admin service account can modify critical fields like `rider_id`
+* 🔢 OTP‑based ride start ensures physical rider‑passenger verification
+
+These measures reduce:
+
+* Fake ride starts
+* Data tampering
+* Unauthorized access
+
+---
+
+## 📊 Data‑Driven Urban Insights
+
+Because all ride data flows through Firestore and Python:
+
+* Ride density maps can be generated
+* Peak demand hours can be analyzed
+* City‑wise expansion decisions can be simulated
+
+This makes Rydora useful not only as an app, but also as a **mobility analytics platform**.
+
+---
+
+## 🧪 Academic & Industry Relevance
+
+Rydora is suitable for:
+
+* 🎓 Final‑year / capstone projects
+* 🚀 Startup MVPs
+* 🧩 System‑design interviews
+* 📱 Flutter + Firebase case studies
+
+It demonstrates real‑world concepts such as:
+
+* Distributed systems
+* Secure backend‑controlled logic
+* Geo‑spatial computation
+* Cost‑aware API design
+* Admin‑driven orchestration
+
+---
+
+## 🔮 Future Enhancements
+
+Planned or easily extendable features:
+
+* AI‑based demand prediction
+* Dynamic surge pricing
+* Ride pooling / shared rides
+* In‑app payments
+* Driver rating & fraud detection
+
+
+
+📬 Contact
+
+Project Author:
+Name: Chandan M
+Email: chandan.chandu0608@gmail.com
